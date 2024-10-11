@@ -1,0 +1,4 @@
+_kernel void kernel()
+{
+
+}
