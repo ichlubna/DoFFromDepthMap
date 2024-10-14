@@ -13,5 +13,7 @@ main.cpp
 )
 
 find_package(OpenCL REQUIRED)
+
 add_executable(${PROJECT_NAME} ${SOURCES})
 target_link_libraries(${PROJECT_NAME} OpenCL::OpenCL)
+configure_file("${CMAKE_SOURCE_DIR}/kernel.cl" "${CMAKE_CURRENT_BINARY_DIR}/kernel.cl" COPYONLY)

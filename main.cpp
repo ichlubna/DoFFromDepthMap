@@ -1,4 +1,5 @@
 #include <CL/opencl.hpp>
+#include <stdexcept>
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -8,10 +9,6 @@
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-#define TINYEXR_USE_STB_ZLIB 1
-#define TINYEXR_USE_MINIZ 0
-#define TINYEXR_IMPLEMENTATION
-#include "tinyexr.h"
 
 class Params
 {
@@ -37,67 +34,64 @@ void process(Params params)
     file.close();
     cl::Program program(context, kernelContent.str(), true);
     cl::CommandQueue queue(context);
-   
+  
+    std::cerr << "Loading input image" << std::endl;
     int imageWidth, imageHeight, imageChannels;
-    unsigned char *imageData = stbi_load(params.inputImage.c_str(), &imageWidth, &imageHeight, &imageChannels, 0);
+    int imageChannelsGPU = 4;
+    unsigned char *imageData = stbi_load(params.inputImage.c_str(), &imageWidth, &imageHeight, &imageChannels, imageChannelsGPU);
     if (imageData == nullptr)
         throw std::runtime_error("Failed to load image");
-    int depthWidth, depthHeight;
     const char* err = nullptr;
-    /*
-    float* depthData;
-    if(LoadEXR(&depthData, &depthWidth, &depthHeight, params.depthMap.c_str(), &err) != TINYEXR_SUCCESS)
-    {
-        FreeEXRErrorMessage(err);
+   
+    int depthWidth, depthHeight, depthChannels;
+    float *depthData = stbi_loadf(params.depthMap.c_str(), &depthWidth, &depthHeight, &depthChannels, 1);
+    if (imageData == nullptr)
         throw std::runtime_error("Failed to load depth map");
-    }
-    if(imageWidth != depthWidth || imageHeight != depthHeight)
-        throw std::runtime_error("Image and depth map must be the same size");
-    */
-
-    EXRHeader exrHeader;
-    EXRVersion exrVersion;
-    InitEXRHeader(&exrHeader);
-    ParseEXRHeaderFromFile(&exrHeader, &exrVersion, params.depthMap.c_str(), &err);
-    for (int i = 0; i < exrHeader.num_channels; i++)
-        if (exrHeader.pixel_types[i] == TINYEXR_PIXELTYPE_HALF) 
-            exrHeader.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
-    EXRImage exr_image;
-    InitEXRImage(&exr_image);
-    if(LoadEXRImageFromFile(&exr_image, &exrHeader,params.depthMap.c_str(), &err) != TINYEXR_SUCCESS)
+    
+    float maxDepth = 0;
+    for(int i = 0; i < depthWidth * depthHeight; i++)
     {
-        FreeEXRErrorMessage(err);
-        throw std::runtime_error("Failed to load depth map");
+        if(depthData[i] > maxDepth)
+            maxDepth = depthData[i];
     }
-    std::vector<float> depthData(exr_image.width * exr_image.height);
-    for(size_t i = 0; i < exr_image.width * exr_image.height * exr_image.num_channels; i += exr_image.num_channels)
-        depthData[i] = exr_image.images[0][i];
+    float depthDifference = maxDepth-params.focus;    
+    float depthLimit = (depthDifference > params.focus) ? depthDifference : params.focus; 
 
-    const cl::ImageFormat imageFormat(CL_RGB, CL_UNSIGNED_INT8);
+    std::cerr << "Allocating GPU memory" << std::endl;
+    const cl::ImageFormat imageFormat(CL_RGBA, CL_UNSIGNED_INT8);
 	cl::Image2D inputImageGPU(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, imageFormat, imageWidth, imageHeight, 0, imageData);
-	cl::Image2D tempImageGPU(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, imageFormat, imageWidth, imageHeight, 0, nullptr);
-	cl::Image2D outputImageGPU(context, CL_MEM_WRITE_ONLY | CL_MEM_COPY_HOST_PTR, imageFormat, imageWidth, imageHeight, 0, nullptr);
+	cl::Image2D tempImageGPU(context, CL_MEM_READ_WRITE, imageFormat, imageWidth, imageHeight, 0, nullptr);
+	cl::Image2D outputImageGPU(context, CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY, imageFormat, imageWidth, imageHeight, 0, nullptr);
     const cl::ImageFormat depthFormat(CL_R, CL_FLOAT);
-	cl::Image2D inputDepthGPU(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, depthFormat, imageWidth, imageHeight, 0, depthData.data());
+	cl::Image2D inputDepthGPU(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, depthFormat, imageWidth, imageHeight, 0, depthData);
 
     stbi_image_free(imageData);
 
-    auto kernel = cl::compatibility::make_kernel<>(program, "kernel");
-    kernel(cl::EnqueueArgs(queue, cl::NDRange(imageWidth, imageHeight)));
-    queue.finish();
+    std::cerr << "Processing on GPU" << std::endl;
+    auto kernel = cl::compatibility::make_kernel<cl::Image2D&, cl::Image2D&, cl::Image2D&, cl::Image2D&, float>(program, "kernelMain"); 
+    cl_int buildErr = CL_SUCCESS; 
+    auto buildInfo = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(&buildErr);
+    for (auto &pair : buildInfo)
+        if(!pair.second.empty() && !std::all_of(pair.second.begin(),pair.second.end(),isspace))
+            std::cerr << pair.second << std::endl;
+    cl::EnqueueArgs kernelArgs(queue, cl::NDRange(imageWidth, imageHeight));
+    kernel(kernelArgs, inputImageGPU, tempImageGPU, outputImageGPU, inputDepthGPU, depthLimit);
 
+    std::cerr << "Storing the result" << std::endl;
     cl::array<size_t, 3> origin{0, 0, 0};
     cl::array<size_t, 3> size{static_cast<size_t>(imageWidth), static_cast<size_t>(imageHeight), 1};
-    std::vector<unsigned char> outData(imageWidth * imageHeight * imageChannels);
-    queue.enqueueReadImage(outputImageGPU, CL_TRUE, origin, size, 0, 0, outData.data());
-    stbi_write_png(params.outputImage.c_str(), imageWidth, imageHeight, imageChannels, outData.data(), imageWidth * imageChannels);
+    std::vector<unsigned char> outData;
+    outData.resize(imageWidth * imageHeight * imageChannelsGPU);
+    if(queue.enqueueReadImage(outputImageGPU, CL_TRUE, origin, size, 0, 0, outData.data()) != CL_SUCCESS)
+        throw std::runtime_error("Cannot download the result");
+    stbi_write_png(params.outputImage.c_str(), imageWidth, imageHeight, imageChannelsGPU, outData.data(), imageWidth * imageChannelsGPU);
 }
 
 int main(int argc, char *argv[])
 {
     std::string helpText =  "This program takes a depth map, an image and focusing values and simulates a depth of field\n"
                             "--help, -h Prints this help\n"
-                            "-i input image\n"
+                            "-i input image - 8-BIT RGBA\n"
                             "-o output image\n"
                             "-d input depth map\n"
                             "-f foucus distance in the same units as values in the depth map\n"
