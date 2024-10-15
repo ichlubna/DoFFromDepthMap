@@ -55,12 +55,12 @@ void process(Params params)
             maxDepth = depthData[i];
     }
     float depthDifference = maxDepth-params.focus;    
-    float depthLimit = (depthDifference > params.focus) ? depthDifference : params.focus; 
+    float depthLimit = (depthDifference > params.focus) ? depthDifference : params.focus;
+    depthLimit -= params.focusBounds; 
 
     std::cerr << "Allocating GPU memory" << std::endl;
     const cl::ImageFormat imageFormat(CL_RGBA, CL_UNSIGNED_INT8);
 	cl::Image2D inputImageGPU(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, imageFormat, imageWidth, imageHeight, 0, imageData);
-	cl::Image2D tempImageGPU(context, CL_MEM_READ_WRITE, imageFormat, imageWidth, imageHeight, 0, nullptr);
 	cl::Image2D outputImageGPU(context, CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY, imageFormat, imageWidth, imageHeight, 0, nullptr);
     const cl::ImageFormat depthFormat(CL_R, CL_FLOAT);
 	cl::Image2D inputDepthGPU(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, depthFormat, imageWidth, imageHeight, 0, depthData);
@@ -68,18 +68,20 @@ void process(Params params)
     stbi_image_free(imageData);
 
     std::cerr << "Processing on GPU" << std::endl;
-    auto kernel = cl::compatibility::make_kernel<cl::Image2D&, cl::Image2D&, cl::Image2D&, cl::Image2D&, float>(program, "kernelMain"); 
+    auto kernel = cl::compatibility::make_kernel<cl::Image2D&,cl::Image2D&, cl::Image2D&, float, int, float, float>(program, "kernelMain"); 
     cl_int buildErr = CL_SUCCESS; 
     auto buildInfo = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(&buildErr);
     for (auto &pair : buildInfo)
         if(!pair.second.empty() && !std::all_of(pair.second.begin(),pair.second.end(),isspace))
             std::cerr << pair.second << std::endl;
     cl::EnqueueArgs kernelArgs(queue, cl::NDRange(imageWidth, imageHeight));
-    kernel(kernelArgs, inputImageGPU, tempImageGPU, outputImageGPU, inputDepthGPU, depthLimit);
-
-    std::cerr << "Storing the result" << std::endl;
+    kernel(kernelArgs, inputImageGPU,outputImageGPU, inputDepthGPU, depthLimit, params.strength, params.focus, params.focusBounds);
+    queue.finish();
     cl::array<size_t, 3> origin{0, 0, 0};
     cl::array<size_t, 3> size{static_cast<size_t>(imageWidth), static_cast<size_t>(imageHeight), 1};
+    //queue.enqueueCopyImage(outputImageGPU, inputImageGPU, origin, origin, size);
+
+    std::cerr << "Storing the result" << std::endl;
     std::vector<unsigned char> outData;
     outData.resize(imageWidth * imageHeight * imageChannelsGPU);
     if(queue.enqueueReadImage(outputImageGPU, CL_TRUE, origin, size, 0, 0, outData.data()) != CL_SUCCESS)
@@ -96,7 +98,7 @@ int main(int argc, char *argv[])
                             "-d input depth map\n"
                             "-f foucus distance in the same units as values in the depth map\n"
                             "-b focus bounds - how much around the focus distance is to stay focused \n"
-                            "-s blur distance in pixels \n";
+                            "-s blur kernel radius in pixel in the most blurred areas \n";
     Arguments args(argc, argv);
     if(args.printHelpIfPresent(helpText))
         return 0;
