@@ -66,6 +66,7 @@ void process(Params params)
 	cl::Image2D inputDepthGPU(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, depthFormat, imageWidth, imageHeight, 0, depthData);
 
     stbi_image_free(imageData);
+    stbi_image_free(depthData);
 
     std::cerr << "Processing on GPU" << std::endl;
     auto kernel = cl::compatibility::make_kernel<cl::Image2D&,cl::Image2D&, cl::Image2D&, float, int, float, float>(program, "kernelMain"); 
